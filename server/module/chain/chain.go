@@ -149,20 +149,28 @@ func NewBlockchain(dataDir string) (*Blockchain, error) {
 		dataDir:       dataDir,
 	}
 
-	// ジェネシスブロック作成
+	// ジェネシスブロック作成 (Timestamp = 0 = 1970-01-01 UTC)
 	genesis := &Block{
 		Height:       0,
 		PreviousHash: "0x" + string([]byte{'0'}) + "0000000000000000000000000000000000000000000000000000000000000000"[1:],
-		Timestamp:    1739700000, // 2025-02-16T00:00:00Z
+		Timestamp:    0, // 1970-01-01T00:00:00Z
 		Nonce:        0,
 		Difficulty:   24,
 		Miner:        "0x" + string([]byte{'0'}) + "000000000000000000000000000000000000",
 		Reward:       "0",
 		Transactions: []Transaction{},
 	}
-	genesis.Hash = bc.CalculateBlockHash(genesis)
-	bc.genesisHash = genesis.Hash
 
+	// ジェネシスブロックをマイニング（Proof of Work計算）
+	for nonce := uint64(0); ; nonce++ {
+		genesis.Nonce = nonce
+		genesis.Hash = bc.CalculateBlockHash(genesis)
+		if bc.CheckPoW(genesis.Hash, genesis.Difficulty) {
+			break
+		}
+	}
+
+	bc.genesisHash = genesis.Hash
 	bc.blocks[genesis.Hash] = genesis
 	bc.chain = append(bc.chain, genesis.Hash)
 

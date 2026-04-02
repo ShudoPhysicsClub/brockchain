@@ -372,3 +372,200 @@ func parseSeedNodeAddress(value string) (string, uint16, error) {
 	}
 	return text, 0, nil
 }
+
+// ============================================================
+// HTTP API サーバー機能
+// ============================================================
+
+// StartAPIServer は HTTP API サーバーを起動する
+func (c *RPCClient) StartAPIServer(host string, port int) error {
+	if host == "" {
+		host = "0.0.0.0"
+	}
+	if port <= 0 {
+		port = 8080
+	}
+
+	addr := fmt.Sprintf("%s:%d", host, port)
+
+	http.HandleFunc("/api/status", c.handleStatus)
+	http.HandleFunc("/api/token", c.handleToken)
+	http.HandleFunc("/api/user", c.handleUser)
+	http.HandleFunc("/api/pool", c.handlePool)
+	http.HandleFunc("/api/submit-tx", c.handleSubmitTx)
+	http.HandleFunc("/api/submit-block", c.handleSubmitBlock)
+
+	// ルートエンドポイント
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprintf(w, "Brockchain Go Client API Server\n\nAvailable endpoints:\n")
+		fmt.Fprintf(w, "POST /api/status        - Get node status\n")
+		fmt.Fprintf(w, "POST /api/token         - Get token info\n")
+		fmt.Fprintf(w, "POST /api/user          - Get user info\n")
+		fmt.Fprintf(w, "POST /api/pool          - Get pool info\n")
+		fmt.Fprintf(w, "POST /api/submit-tx     - Submit transaction (JSON body)\n")
+		fmt.Fprintf(w, "POST /api/submit-block  - Submit block (JSON body)\n")
+	})
+
+	fmt.Printf("🚀 Brockchain Go Client API Server started on http://%s\n", addr)
+	return http.ListenAndServe(addr, nil)
+}
+
+// handleStatus は /api/status をハンドル
+func (c *RPCClient) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	result, err := c.Status()
+	if err != nil {
+		writeError(w, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+// handleToken は /api/token をハンドル
+func (c *RPCClient) handleToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var payload map[string]string
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeError(w, "invalid json: "+err.Error())
+		return
+	}
+
+	query := payload["query"]
+	if query == "" {
+		writeError(w, "missing query parameter")
+		return
+	}
+
+	result, err := c.GetToken(query)
+	if err != nil {
+		writeError(w, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+// handleUser は /api/user をハンドル
+func (c *RPCClient) handleUser(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var payload map[string]string
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeError(w, "invalid json: "+err.Error())
+		return
+	}
+
+	query := payload["query"]
+	if query == "" {
+		writeError(w, "missing query parameter")
+		return
+	}
+
+	result, err := c.GetUser(query)
+	if err != nil {
+		writeError(w, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+// handlePool は /api/pool をハンドル
+func (c *RPCClient) handlePool(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var payload map[string]string
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeError(w, "invalid json: "+err.Error())
+		return
+	}
+
+	query := payload["query"]
+	if query == "" {
+		writeError(w, "missing query parameter")
+		return
+	}
+
+	result, err := c.GetPool(query)
+	if err != nil {
+		writeError(w, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+// handleSubmitTx は /api/submit-tx をハンドル
+func (c *RPCClient) handleSubmitTx(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var tx map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&tx); err != nil {
+		writeError(w, "invalid json: "+err.Error())
+		return
+	}
+
+	result, err := c.SubmitTransaction(tx)
+	if err != nil {
+		writeError(w, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+// handleSubmitBlock は /api/submit-block をハンドル
+func (c *RPCClient) handleSubmitBlock(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var block map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&block); err != nil {
+		writeError(w, "invalid json: "+err.Error())
+		return
+	}
+
+	result, err := c.SubmitBlock(block)
+	if err != nil {
+		writeError(w, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+// writeError はエラーレスポンスを書き込む
+func writeError(w http.ResponseWriter, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"error": message,
+	})
+}
