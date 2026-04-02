@@ -1,0 +1,21 @@
+{
+  "name": "brockchain-client-ts",
+  "version": "1.0.0",
+  "description": "Brockchain TypeScript RPC client",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch"
+  },
+  "keywords": [
+    "brockchain",
+    "rpc",
+    "client"
+  ],
+  "author": "ShudoPhysicsClub",
+  "license": "ISC",
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}
