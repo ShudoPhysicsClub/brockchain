@@ -296,7 +296,80 @@ func (bc *Blockchain) AddBlock(block *Block) error {
 		bc.adjustDifficulty(block.Height)
 	}
 
+	// メモリ最適化：最新ブロック以外をメモリから削除
+	bc.trimMemoryCacheUnlocked()
+
 	return nil
+}
+
+// trimMemoryCacheUnlocked は最新ブロック以外をメモリから削除（メモリ最適化）
+// ロック取得なしで実行（AddBlock 内から呼ばれるため）
+func (bc *Blockchain) trimMemoryCacheUnlocked() {
+	if len(bc.chain) < 2 {
+		return // ジェネシスのみ、または空
+	}
+
+	// 最新ブロックのハッシュ
+	latestHash := bc.chain[len(bc.chain)-1]
+
+	// ジェネシスブロックのハッシュ
+	genesisHash := bc.chain[0]
+
+	// 最新ブロックとジェネシス以外をメモリから削除
+	for hash := range bc.blocks {
+		if hash != latestHash && hash != genesisHash {
+			delete(bc.blocks, hash)
+		}
+	}
+}
+
+// loadBlockFromDisk はハッシュからブロックをディスクから読込
+func (bc *Blockchain) loadBlockFromDisk(hash string) *Block {
+	// ディレクトリを列挙してハッシュに対応するファイルを探す
+	chainDir := filepath.Join(bc.dataDir, "chain")
+	entries, err := ioutil.ReadDir(chainDir)
+	if err != nil {
+		return nil
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		heightDir := filepath.Join(chainDir, entry.Name())
+		filePath := filepath.Join(heightDir, hash+".json")
+		if _, err := os.Stat(filePath); err == nil {
+			data, err := ioutil.ReadFile(filePath)
+			if err != nil {
+				return nil
+			}
+			var block *Block
+			if err := json.Unmarshal(data, &block); err != nil {
+				return nil
+			}
+			return block
+		}
+	}
+
+	return nil
+}
+
+// loadBlockFromDiskByHeight は高さからブロックをディスクから読込
+func (bc *Blockchain) loadBlockFromDiskByHeight(height uint64, blockHash string) *Block {
+	heightDir := filepath.Join(bc.dataDir, "chain", strconv.FormatUint(height, 10))
+	filePath := filepath.Join(heightDir, blockHash+".json")
+
+	data, err := ioutil.ReadFile(filePath)
+	if err != nil {
+		return nil
+	}
+
+	var block *Block
+	if err := json.Unmarshal(data, &block); err != nil {
+		return nil
+	}
+
+	return block
 }
 
 // validateBlockUnlocked はロック取得なしでブロック検証（内部用）
@@ -396,25 +469,39 @@ func (bc *Blockchain) GetLatestBlock() *Block {
 	return bc.blocks[latestHash]
 }
 
-// GetBlock はハッシュでブロックを取得
+// GetBlock はハッシュでブロックを取得（メモリにない場合はディスクから読込）
 func (bc *Blockchain) GetBlock(hash string) *Block {
 	bc.mu.RLock()
-	defer bc.mu.RUnlock()
+	block := bc.blocks[hash]
+	bc.mu.RUnlock()
 
-	return bc.blocks[hash]
+	if block != nil {
+		return block
+	}
+
+	// メモリにない場合、ディスクから読込
+	return bc.loadBlockFromDisk(hash)
 }
 
-// GetBlockByHeight は高さでブロックを取得
+// GetBlockByHeight は高さでブロックを取得（メモリにない場合はディスクから読込）
 func (bc *Blockchain) GetBlockByHeight(height uint64) *Block {
 	bc.mu.RLock()
-	defer bc.mu.RUnlock()
 
 	if height >= uint64(len(bc.chain)) {
+		bc.mu.RUnlock()
 		return nil
 	}
 
 	blockHash := bc.chain[height]
-	return bc.blocks[blockHash]
+	block := bc.blocks[blockHash]
+	bc.mu.RUnlock()
+
+	if block != nil {
+		return block
+	}
+
+	// メモリにない場合、ディスクから読込
+	return bc.loadBlockFromDiskByHeight(height, blockHash)
 }
 
 // GetChainHeight はチェーンの高さを取得
@@ -585,6 +672,9 @@ func (bc *Blockchain) FinalizeSyncBlocks() error {
 		// sync/ から削除
 		_ = os.Remove(filePath)
 	}
+
+	// メモリ最適化：ブロック追加完了後にメモリをコンパクト化
+	bc.trimMemoryCacheUnlocked()
 
 	return nil
 }

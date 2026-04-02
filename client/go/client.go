@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -124,10 +125,20 @@ func NewRPCClient(host string, port uint16, timeout time.Duration) *RPCClient {
 	}
 
 	endpoint := fmt.Sprintf("https://%s:%d/rpc", host, port)
+
+	// TLS 検証スキップ（自己署証明書対応）
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: true,
+	}
+	transport := &http.Transport{
+		TLSClientConfig: tlsConfig,
+	}
+
 	return &RPCClient{
 		Endpoint: endpoint,
 		HTTP: &http.Client{
-			Timeout: timeout,
+			Timeout:   timeout,
+			Transport: transport,
 		},
 		nextID: 1,
 	}
