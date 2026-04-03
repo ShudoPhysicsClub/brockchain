@@ -3,12 +3,12 @@ package mempool
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
 
 	"github.com/ShudoPhysicsClub/brockchain/module/chain"
+	"github.com/ShudoPhysicsClub/brockchain/module/crypto"
 )
 
 // Mempool はトランザクション メモリプール
@@ -30,7 +30,7 @@ func NewMempool(maxSize int) *Mempool {
 
 // calculateTxHash はトランザクションハッシュを計算
 func calculateTxHash(tx *chain.Transaction) string {
-	data, err := json.Marshal(tx)
+	data, err := crypto.CanonicalJSON(tx)
 	if err != nil {
 		data = []byte(fmt.Sprintf("%s:%s:%s:%d:%d", tx.From, tx.To, tx.Amount, tx.Nonce, tx.Timestamp))
 	}

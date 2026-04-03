@@ -4,8 +4,10 @@ import (
 	"crypto/elliptic"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"math/big"
+	"sort"
 )
 
 var curve = elliptic.P256()
@@ -61,6 +63,45 @@ func concat(arrays ...[]byte) []byte {
 		out = append(out, a...)
 	}
 	return out
+}
+
+func canonicalJSONValue(v any) any {
+	switch x := v.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(x))
+		for key := range x {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		ordered := make(map[string]any, len(x))
+		for _, key := range keys {
+			ordered[key] = canonicalJSONValue(x[key])
+		}
+		return ordered
+	case []any:
+		items := make([]any, len(x))
+		for i := range x {
+			items[i] = canonicalJSONValue(x[i])
+		}
+		return items
+	default:
+		return v
+	}
+}
+
+// CanonicalJSON は JSON オブジェクトのキー順を辞書順に正規化する。
+// Node 側の canonicalJSON と同じく、配列の順序は維持しつつ、
+// オブジェクトはキーをソートした再帰的な JSON を返す。
+func CanonicalJSON(v any) ([]byte, error) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	var decoded any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return nil, err
+	}
+	return json.Marshal(canonicalJSONValue(decoded))
 }
 
 // --- RFC6979 決定論的ノンス生成 ---

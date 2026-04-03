@@ -1,3 +1,11 @@
+import {
+  type BlockLike,
+  type TransactionLike,
+  buildBlockHashPreimage,
+  buildTransactionSigningMessage,
+  calculateBlockHash,
+} from './codec';
+
 interface RPCRequest {
   jsonrpc: string;
   method: string;
@@ -145,6 +153,21 @@ export class BrockchaRPCClient {
 
   async submitBlock(block: any): Promise<any> {
     return this.call('brockchain_submitBlock', { block });
+  }
+
+  // サーバーと同じ canonical JSON 規約で署名メッセージを作る
+  buildTransactionSigningMessage(tx: TransactionLike): Uint8Array {
+    return buildTransactionSigningMessage(tx);
+  }
+
+  // サーバーと同じ canonical JSON 規約でブロックハッシュ前イメージを作る
+  buildBlockHashPreimage(block: BlockLike): Uint8Array {
+    return buildBlockHashPreimage(block);
+  }
+
+  // サーバーと同じ SHA-256 ルールでブロックハッシュを計算
+  async calculateBlockHash(block: BlockLike): Promise<string> {
+    return calculateBlockHash(block);
   }
 
   async rpc(method: string, params: any = {}): Promise<any> {

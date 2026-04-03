@@ -22,6 +22,8 @@ const (
 	DefaultGasFee = "0.05"
 	// TokenIDHashBytes は token id に使うハッシュ先頭バイト数。
 	TokenIDHashBytes = 8
+	// BlockTimestampToleranceSeconds は受理するブロック時刻の許容差（秒）。
+	BlockTimestampToleranceSeconds = int64(600)
 )
 
 // Block はブロックチェーンのブロック
@@ -179,18 +181,11 @@ func NewBlockchain(dataDir string) (*Blockchain, error) {
 
 // CalculateBlockHash はブロックのハッシュを計算
 func (bc *Blockchain) CalculateBlockHash(block *Block) string {
-	// previousHash + timestamp + nonce + difficulty + miner + reward + transactions
-	data := fmt.Sprintf(
-		"%s%d%d%d%s%s%v",
-		block.PreviousHash,
-		block.Timestamp,
-		block.Nonce,
-		block.Difficulty,
-		block.Miner,
-		block.Reward,
-		block.Transactions,
-	)
-	hash := sha256.Sum256([]byte(data))
+	preimage, err := BuildBlockHashPreimage(block)
+	if err != nil {
+		return ""
+	}
+	hash := sha256.Sum256(preimage)
 	return hex.EncodeToString(hash[:])
 }
 
@@ -242,9 +237,8 @@ func (bc *Blockchain) ValidateBlock(block *Block) error {
 		}
 	}
 
-	// タイムスタンプ確認（5分以内）
-	now := time.Now().Unix()
-	if now-block.Timestamp > 300 || block.Timestamp-now > 300 {
+	// タイムスタンプ確認（許容差内）
+	if !isTimestampWithinTolerance(block.Timestamp) {
 		return errors.New("block timestamp out of range")
 	}
 
@@ -390,7 +384,22 @@ func (bc *Blockchain) validateBlockUnlocked(block *Block) error {
 		return errors.New("previous block not found")
 	}
 
+	if !isTimestampWithinTolerance(block.Timestamp) {
+		return errors.New("block timestamp out of range")
+	}
+
 	return nil
+}
+
+func isTimestampWithinTolerance(ts int64) bool {
+	now := time.Now().Unix()
+	if now-ts > BlockTimestampToleranceSeconds {
+		return false
+	}
+	if ts-now > BlockTimestampToleranceSeconds {
+		return false
+	}
+	return true
 }
 
 // adjustDifficulty は LWMA（線形加重移動平均）方式で難易度を調整
@@ -729,11 +738,10 @@ func (bc *Blockchain) ValidateTransaction(tx *Transaction) error {
 		return fmt.Errorf("invalid public key format: %w", err)
 	}
 
-	// トランザクションメッセージの構成（署名対象）
-	// From, To, Amount, Nonce, Timestamp を含める
-	message := fmt.Sprintf("%s:%s:%s:%d:%d",
-		tx.From, tx.To, tx.Amount, tx.Nonce, tx.Timestamp,
-	)
+	messageBytes, err := BuildTransactionSigningMessage(tx)
+	if err != nil {
+		return fmt.Errorf("transaction canonicalization failed: %w", err)
+	}
 
 	// 署名を配列にコピー
 	var signature crypto.Signature
@@ -743,7 +751,7 @@ func (bc *Blockchain) ValidateTransaction(tx *Transaction) error {
 	copy(publicKey[:], pubKeyBytes)
 
 	// crypto.Verify で検証
-	if !crypto.Verify(publicKey, []byte(message), signature) {
+	if !crypto.Verify(publicKey, messageBytes, signature) {
 		return errors.New("transaction signature verification failed")
 	}
 
