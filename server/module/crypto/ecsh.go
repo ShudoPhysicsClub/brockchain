@@ -30,6 +30,16 @@ func bytesToBig(b []byte) *big.Int {
 	return new(big.Int).SetBytes(b)
 }
 
+func normalizeMessage(msg []byte) [32]byte {
+	var out [32]byte
+	if len(msg) >= len(out) {
+		copy(out[:], msg[len(msg)-len(out):])
+		return out
+	}
+	copy(out[len(out)-len(msg):], msg)
+	return out
+}
+
 func sha256Hash(data []byte) []byte {
 	h := sha256.Sum256(data)
 	return h[:]
@@ -57,7 +67,8 @@ func concat(arrays ...[]byte) []byte {
 
 func generateK(priv PrivateKey, msg []byte) *big.Int {
 	qLen := 32
-	h1 := sha256Hash(msg)
+	normalized := normalizeMessage(msg)
+	h1 := sha256Hash(normalized[:])
 
 	V := make([]byte, qLen)
 	for i := range V {
@@ -120,9 +131,11 @@ func Sign(priv PrivateKey, msg []byte) (Signature, error) {
 	if err != nil {
 		return Signature{}, err
 	}
+	normalized := normalizeMessage(msg)
+	msgBytes := normalized[:]
 
 	// RFC6979で決定論的にkを生成
-	k := generateK(priv, msg)
+	k := generateK(priv, msgBytes)
 
 	Rx, Ry := curve.ScalarBaseMult(k.Bytes())
 
@@ -131,7 +144,7 @@ func Sign(priv PrivateKey, msg []byte) (Signature, error) {
 	h.Write(Ry.Bytes())
 	h.Write(pub[:32]) // Yx
 	h.Write(pub[32:]) // Yy
-	h.Write(msg)
+	h.Write(msgBytes)
 	e := new(big.Int).SetBytes(h.Sum(nil))
 	e.Mod(e, params.N)
 
@@ -152,6 +165,8 @@ func Sign(priv PrivateKey, msg []byte) (Signature, error) {
 // --- 検証 ---
 
 func Verify(pub PublicKey, msg []byte, sig Signature) bool {
+	normalized := normalizeMessage(msg)
+	msgBytes := normalized[:]
 	Yx := bytesToBig(pub[:32])
 	Yy := bytesToBig(pub[32:])
 	if !curve.IsOnCurve(Yx, Yy) {
@@ -166,11 +181,11 @@ func Verify(pub PublicKey, msg []byte, sig Signature) bool {
 	}
 
 	h := sha256.New()
-	h.Write(sig[:32])  // Rx
+	h.Write(sig[:32])   // Rx
 	h.Write(sig[32:64]) // Ry
-	h.Write(pub[:32])  // Yx
-	h.Write(pub[32:])  // Yy
-	h.Write(msg)
+	h.Write(pub[:32])   // Yx
+	h.Write(pub[32:])   // Yy
+	h.Write(msgBytes)
 	e := new(big.Int).SetBytes(h.Sum(nil))
 	e.Mod(e, params.N)
 
