@@ -545,7 +545,3 @@ failed to initialize blockchain
 MIT License
 
 ---
-
-### 開発チーム
-
-ShudoPhysicsClub
