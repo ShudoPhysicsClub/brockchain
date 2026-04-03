@@ -168,15 +168,30 @@ func resolveDNSSeed(seedDomain string) []string {
 	fmt.Printf("✓ DNS Seed から %d 件のノードを取得\n", len(txts))
 
 	for _, txt := range txts {
-		// TXTレコードは "node.example.com:8333" の形式
-		txt = strings.TrimSpace(txt)
-		if txt != "" {
-			peers = append(peers, txt)
-			fmt.Printf("  - %s\n", txt)
+		for _, part := range strings.Split(txt, ",") {
+			addr := extractNodeAddress(part)
+			if addr == "" {
+				continue
+			}
+			peers = append(peers, addr)
+			fmt.Printf("  - %s\n", addr)
 		}
 	}
 
 	return peers
+}
+
+func extractNodeAddress(value string) string {
+	text := strings.TrimSpace(value)
+	if text == "" {
+		return ""
+	}
+
+	if strings.HasPrefix(strings.ToLower(text), "node=") {
+		return strings.TrimSpace(text[len("node="):])
+	}
+
+	return ""
 }
 
 // connectToPeer は指定ピアへの接続を試みる

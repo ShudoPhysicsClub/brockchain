@@ -148,7 +148,7 @@ sync/                               # 検証待機ブロック一時保存
 [server/.env](server/.env) ファイルを作成：
 
 ```env
-DNS_SEED=seed.block.example.com      # DNS TXT レコードで ノード探索
+DNS_SEED=seed.block.example.com      # DNS TXT レコードで node=host:port を探索
 DATA_DIR=./data                      # ブロックチェーン永続化パス
 P2P_PORT=8333                        # P2P イングレッシブ待ち受けポート
 LISTEN_HOST=0.0.0.0                  # リッスンアドレス
@@ -395,7 +395,7 @@ curl -X POST http://localhost:8080/api/submit-tx \
 
 **JSON-RPC 接続設定:**
 - エンドポイント：`https://<host>:59988/rpc` （自動設定）
-- DNS TXT レコードで自動ノード探索可能
+- DNS TXT レコードは `node=host:port` 形式で記述
 
 
 ### TypeScript Web クライアント

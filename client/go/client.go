@@ -273,7 +273,7 @@ func MustJSON(v interface{}) string {
 
 // DiscoverNodesDNS は DNS TXT レコードからノードを発見する
 // dnsSeedDomain 例: "_nodes.seed.shudo-physics.com"
-// 戻り値: "host1:port1,host2:port2" 形式の文字列のリスト
+// TXT は "node=host:port" 形式を使う
 func DiscoverNodesDNS(dnsSeedDomain string) ([]string, error) {
 	if dnsSeedDomain == "" {
 		return nil, errors.New("dns seed domain is empty")
@@ -291,12 +291,10 @@ func DiscoverNodesDNS(dnsSeedDomain string) ([]string, error) {
 
 	var nodes []string
 	for _, record := range txtRecords {
-		// 各 TXT レコードはカンマ区切りのノードアドレスを含む
-		// 例: "192.168.1.1:8333,192.168.1.2:8333"
 		parts := strings.Split(record, ",")
 		for _, part := range parts {
-			addr := strings.TrimSpace(part)
-			if addr != "" {
+			addr, ok := extractNodeAddress(part)
+			if ok {
 				nodes = append(nodes, addr)
 			}
 		}
@@ -307,6 +305,22 @@ func DiscoverNodesDNS(dnsSeedDomain string) ([]string, error) {
 	}
 
 	return nodes, nil
+}
+
+func extractNodeAddress(value string) (string, bool) {
+	text := strings.TrimSpace(value)
+	if text == "" {
+		return "", false
+	}
+
+	if strings.HasPrefix(strings.ToLower(text), "node=") {
+		addr := strings.TrimSpace(text[len("node="):])
+		if addr != "" {
+			return addr, true
+		}
+	}
+
+	return "", false
 }
 
 // ConnectRandomNode は DNS を使って検出したノードの中からランダムに選択して接続する
