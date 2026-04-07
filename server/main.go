@@ -2646,7 +2646,6 @@ func main() {
 			fmt.Println("  height        - ブロックチェーン高")
 			fmt.Println("  token         - token 検索")
 			fmt.Println("  user          - user 検索")
-			fmt.Println("  mine [diff]   - ローカルでブロックを採掘して追加")
 			fmt.Println("  help          - ヘルプを表示")
 
 		case "peers":
@@ -2711,32 +2710,6 @@ func main() {
 			}
 			payload, _ := json.MarshalIndent(record, "", "  ")
 			fmt.Println(string(payload))
-
-		case "mine":
-			miner := "0x" + strings.Repeat("0", 40)
-			difficulty := 0
-			if len(parts) >= 2 {
-				if parsed, err := strconv.Atoi(parts[1]); err == nil {
-					difficulty = parsed
-				}
-			}
-			if len(parts) >= 3 {
-				miner = parts[2]
-			}
-
-			fmt.Printf("⛏ 採掘開始: miner=%s difficulty=%d\n", miner, difficulty)
-			block, err := node.MineBlock(miner, difficulty)
-			if err != nil {
-				fmt.Printf("❌ 採掘失敗: %v\n", err)
-				continue
-			}
-
-			if err := node.ValidateAndAddBlock(block); err != nil {
-				fmt.Printf("❌ ブロック追加失敗: %v\n", err)
-				continue
-			}
-
-			fmt.Printf("✓ ブロック採掘成功: height=%d hash=%s tx=%d\n", block.Height, block.Hash, len(block.Transactions))
 
 		default:
 			fmt.Printf("⚠ 不明なコマンド: %s\n", command)
