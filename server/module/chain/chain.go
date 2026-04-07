@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"io/ioutil"
 	"math/big"
 	"os"
@@ -24,6 +25,8 @@ const (
 	TokenIDHashBytes = 8
 	// BlockTimestampToleranceSeconds は受理するブロック時刻の許容差（秒）。
 	BlockTimestampToleranceSeconds = int64(600)
+	// HardcodedGenesisHash はネットワーク共通で使う固定ジェネシスのハッシュ。
+	HardcodedGenesisHash = "0000008606fe3e55b2164350984c436da45cf81cf967acc182b2cbc8b3566e89"
 )
 
 // Block はブロックチェーンのブロック
@@ -151,30 +154,35 @@ func NewBlockchain(dataDir string) (*Blockchain, error) {
 		dataDir:       dataDir,
 	}
 
-	// ジェネシスブロック作成 (Timestamp = 0 = 1970-01-01 UTC)
+	// 固定ジェネシスを使用して、全ノードで起点を一致させる。
 	genesis := &Block{
 		Height:       0,
-		PreviousHash: "0x" + string([]byte{'0'}) + "0000000000000000000000000000000000000000000000000000000000000000"[1:],
-		Timestamp:    0, // 1970-01-01T00:00:00Z
-		Nonce:        0,
+		PreviousHash: "0x0000000000000000000000000000000000000000000000000000000000000000",
+		Timestamp:    0,
+		Nonce:        9109588,
 		Difficulty:   24,
-		Miner:        "0x" + string([]byte{'0'}) + "000000000000000000000000000000000000",
+		Miner:        "0x0000000000000000000000000000000000000",
 		Reward:       "0",
 		Transactions: []Transaction{},
+		Hash:         HardcodedGenesisHash,
 	}
 
-	// ジェネシスブロックをマイニング（Proof of Work計算）
-	for nonce := uint64(0); ; nonce++ {
-		genesis.Nonce = nonce
-		genesis.Hash = bc.CalculateBlockHash(genesis)
-		if bc.CheckPoW(genesis.Hash, genesis.Difficulty) {
-			break
-		}
+	if !bc.CheckPoW(genesis.Hash, genesis.Difficulty) {
+		return nil, errors.New("hardcoded genesis does not satisfy proof of work")
+	}
+
+	if expected := bc.CalculateBlockHash(genesis); expected != genesis.Hash {
+		return nil, fmt.Errorf("hardcoded genesis hash mismatch: expected %s, got %s", expected, genesis.Hash)
 	}
 
 	bc.genesisHash = genesis.Hash
 	bc.blocks[genesis.Hash] = genesis
 	bc.chain = append(bc.chain, genesis.Hash)
+
+	// 起動直後でも chain ファイルが存在するよう、ジェネシスを永続化する。
+	if err := bc.saveBlockToDiskUnlocked(genesis); err != nil {
+		return nil, fmt.Errorf("failed to persist genesis block: %w", err)
+	}
 
 	return bc, nil
 }
@@ -232,7 +240,7 @@ func (bc *Blockchain) ValidateBlock(block *Block) error {
 
 	// 前ブロックの存在確認（ジェネシス以外）
 	if block.Height > 0 {
-		if _, exists := bc.blocks[block.PreviousHash]; !exists {
+		if bc.getBlockByHashUnlocked(block.PreviousHash) == nil {
 			return errors.New("previous block not found")
 		}
 	}
@@ -285,6 +293,11 @@ func (bc *Blockchain) AddBlock(block *Block) error {
 	bc.blocks[block.Hash] = block
 	bc.chain = append(bc.chain, block.Hash)
 
+	// chain 追加時点で必ず永続化する。
+	if err := bc.saveBlockToDiskUnlocked(block); err != nil {
+		return fmt.Errorf("failed to persist block: %w", err)
+	}
+
 	// 難易度調整（20ブロックごと）
 	if block.Height > 0 && block.Height%20 == 0 {
 		bc.adjustDifficulty(block.Height)
@@ -319,38 +332,42 @@ func (bc *Blockchain) trimMemoryCacheUnlocked() {
 
 // loadBlockFromDisk はハッシュからブロックをディスクから読込
 func (bc *Blockchain) loadBlockFromDisk(hash string) *Block {
-	// ディレクトリを列挙してハッシュに対応するファイルを探す
 	chainDir := filepath.Join(bc.dataDir, "chain")
-	entries, err := ioutil.ReadDir(chainDir)
+	want := hash + ".json"
+	var found *Block
+	err := filepath.WalkDir(chainDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if d == nil || d.IsDir() {
+			return nil
+		}
+		if filepath.Base(path) != want {
+			return nil
+		}
+
+		data, readErr := ioutil.ReadFile(path)
+		if readErr != nil {
+			return nil
+		}
+
+		var block *Block
+		if unmarshalErr := json.Unmarshal(data, &block); unmarshalErr != nil {
+			return nil
+		}
+
+		found = block
+		return fs.SkipAll
+	})
 	if err != nil {
 		return nil
 	}
-
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		heightDir := filepath.Join(chainDir, entry.Name())
-		filePath := filepath.Join(heightDir, hash+".json")
-		if _, err := os.Stat(filePath); err == nil {
-			data, err := ioutil.ReadFile(filePath)
-			if err != nil {
-				return nil
-			}
-			var block *Block
-			if err := json.Unmarshal(data, &block); err != nil {
-				return nil
-			}
-			return block
-		}
-	}
-
-	return nil
+	return found
 }
 
 // loadBlockFromDiskByHeight は高さからブロックをディスクから読込
 func (bc *Blockchain) loadBlockFromDiskByHeight(height uint64, blockHash string) *Block {
-	heightDir := filepath.Join(bc.dataDir, "chain", strconv.FormatUint(height, 10))
+	heightDir := filepath.Join(bc.dataDir, "chain", bucketDirName(height), strconv.FormatUint(height, 10))
 	filePath := filepath.Join(heightDir, blockHash+".json")
 
 	data, err := ioutil.ReadFile(filePath)
@@ -361,6 +378,25 @@ func (bc *Blockchain) loadBlockFromDiskByHeight(height uint64, blockHash string)
 	var block *Block
 	if err := json.Unmarshal(data, &block); err != nil {
 		return nil
+	}
+
+	return block
+}
+
+// getBlockByHashUnlocked はメモリ優先で取得し、なければディスクから復元する。
+// 呼び出し側で lock を保持している前提。
+func (bc *Blockchain) getBlockByHashUnlocked(hash string) *Block {
+	if hash == "" {
+		return nil
+	}
+
+	if block, exists := bc.blocks[hash]; exists && block != nil {
+		return block
+	}
+
+	block := bc.loadBlockFromDisk(hash)
+	if block != nil {
+		bc.blocks[hash] = block
 	}
 
 	return block
@@ -380,7 +416,7 @@ func (bc *Blockchain) validateBlockUnlocked(block *Block) error {
 	}
 
 	// 前ブロックの存在確認
-	if _, exists := bc.blocks[block.PreviousHash]; !exists {
+	if bc.getBlockByHashUnlocked(block.PreviousHash) == nil {
 		return errors.New("previous block not found")
 	}
 
@@ -419,14 +455,20 @@ func (bc *Blockchain) adjustDifficulty(height uint64) {
 
 	for i := 0; i < int(windowSize); i++ {
 		blockHash := bc.chain[startIdx+i]
-		block := bc.blocks[blockHash]
+		block := bc.getBlockByHashUnlocked(blockHash)
+		if block == nil {
+			return
+		}
 
 		weight := int64(i + 1) // 直近ほど重み大きい
 		blockTime := block.Timestamp
 
 		if i > 0 {
 			prevBlockHash := bc.chain[startIdx+i-1]
-			prevBlock := bc.blocks[prevBlockHash]
+			prevBlock := bc.getBlockByHashUnlocked(prevBlockHash)
+			if prevBlock == nil {
+				return
+			}
 			blockTime = block.Timestamp - prevBlock.Timestamp
 
 			// 外れ値フィルタ（30秒～900秒）
@@ -475,7 +517,7 @@ func (bc *Blockchain) GetLatestBlock() *Block {
 	}
 
 	latestHash := bc.chain[len(bc.chain)-1]
-	return bc.blocks[latestHash]
+	return bc.getBlockByHashUnlocked(latestHash)
 }
 
 // GetBlock はハッシュでブロックを取得（メモリにない場合はディスクから読込）
@@ -539,7 +581,10 @@ func (bc *Blockchain) CalculateChainWork() *big.Int {
 
 	totalWork := big.NewInt(0)
 	for _, blockHash := range bc.chain {
-		block := bc.blocks[blockHash]
+		block := bc.getBlockByHashUnlocked(blockHash)
+		if block == nil {
+			continue
+		}
 		work := big.NewInt(2)
 		work.Exp(work, big.NewInt(int64(block.Difficulty)), nil)
 		totalWork.Add(totalWork, work)
@@ -547,18 +592,95 @@ func (bc *Blockchain) CalculateChainWork() *big.Int {
 	return totalWork
 }
 
+// ValidateChainStream はチェーン全体を先頭から逐次検証する。
+// ハッシュ・PoW・前ブロック連結を確認しつつ、古いキャッシュを順次破棄する。
+func (bc *Blockchain) ValidateChainStream() error {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+
+	if len(bc.chain) == 0 {
+		return errors.New("chain is empty")
+	}
+
+	var prev *Block
+	for i, expectedHash := range bc.chain {
+		block := bc.getBlockByHashUnlocked(expectedHash)
+		if block == nil {
+			return fmt.Errorf("missing block at height %d", i)
+		}
+
+		height := uint64(i)
+		if block.Height != height {
+			return fmt.Errorf("height mismatch at %d: got %d", i, block.Height)
+		}
+
+		if block.Hash != expectedHash {
+			return fmt.Errorf("hash index mismatch at %d", i)
+		}
+
+		if calculated := bc.CalculateBlockHash(block); calculated != block.Hash {
+			return fmt.Errorf("block hash mismatch at %d", i)
+		}
+
+		if !bc.CheckPoW(block.Hash, block.Difficulty) {
+			return fmt.Errorf("invalid proof of work at %d", i)
+		}
+
+		if i == 0 {
+			if block.Hash != HardcodedGenesisHash {
+				return fmt.Errorf("genesis hash mismatch")
+			}
+		} else {
+			if prev == nil || block.PreviousHash != prev.Hash {
+				return fmt.Errorf("previous hash mismatch at %d", i)
+			}
+		}
+
+		for txIdx, tx := range block.Transactions {
+			if txIdx == 0 {
+				continue
+			}
+			prevTx := block.Transactions[txIdx-1]
+			if prevTx.From == tx.From && prevTx.Nonce >= tx.Nonce {
+				return fmt.Errorf("transaction nonce order invalid at block %d", i)
+			}
+		}
+
+		prev = block
+
+		if i >= 2 {
+			oldHash := bc.chain[i-2]
+			if oldHash != bc.genesisHash {
+				delete(bc.blocks, oldHash)
+			}
+		}
+	}
+
+	bc.trimMemoryCacheUnlocked()
+	return nil
+}
+
 // SaveBlockToDisk はブロックをディスクに保存 (chain/{height}/{hash}.json)
 func (bc *Blockchain) SaveBlockToDisk(block *Block) error {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
 
-	// ディレクトリパス: chain/{height}/
-	heightDir := filepath.Join(bc.dataDir, "chain", strconv.FormatUint(block.Height, 10))
+	return bc.saveBlockToDiskUnlocked(block)
+}
+
+// saveBlockToDiskUnlocked は lock 取得なしでブロックをディスク保存する内部関数。
+func (bc *Blockchain) saveBlockToDiskUnlocked(block *Block) error {
+	if block == nil || block.Hash == "" {
+		return fmt.Errorf("invalid block")
+	}
+
+	// ディレクトリパス: chain/{bucket-range}/{height}/
+	heightDir := filepath.Join(bc.dataDir, "chain", bucketDirName(block.Height), strconv.FormatUint(block.Height, 10))
 	if err := os.MkdirAll(heightDir, 0755); err != nil {
 		return fmt.Errorf("failed to create directory %s: %w", heightDir, err)
 	}
 
-	// ファイルパス: chain/{height}/{hash}.json
+	// ファイルパス: chain/{bucket-range}/{height}/{hash}.json
 	filePath := filepath.Join(heightDir, block.Hash+".json")
 
 	// JSON にマーシャル
@@ -573,6 +695,17 @@ func (bc *Blockchain) SaveBlockToDisk(block *Block) error {
 	}
 
 	return nil
+}
+
+// bucketDirName はブロック高から 100 区切りバケット名を返す。
+// 0-100, 101-200, 201-300 ...
+func bucketDirName(height uint64) string {
+	if height <= 100 {
+		return "0-100"
+	}
+	start := ((height-1)/100)*100 + 1
+	end := start + 99
+	return fmt.Sprintf("%d-%d", start, end)
 }
 
 // AddSyncBlock はブロックを一時的に sync/ に保存（受信ブロック用）
@@ -670,16 +803,13 @@ func (bc *Blockchain) FinalizeSyncBlocks() error {
 
 			addedCount++
 
-			// ディスク側もマージ（chain/{height}/{hash}.json に移動）
-			heightDir := filepath.Join(bc.dataDir, "chain", strconv.FormatUint(block.Height, 10))
-			if err := os.MkdirAll(heightDir, 0755); err == nil {
-				chainFilePath := filepath.Join(heightDir, block.Hash+".json")
-				_ = ioutil.WriteFile(chainFilePath, data, 0644)
+			if err := bc.saveBlockToDiskUnlocked(block); err != nil {
+				continue
 			}
-		}
 
-		// sync/ から削除
-		_ = os.Remove(filePath)
+			// chain に反映できたブロックだけ sync から削除する。
+			_ = os.Remove(filePath)
+		}
 	}
 
 	// メモリ最適化：ブロック追加完了後にメモリをコンパクト化
@@ -709,6 +839,112 @@ func (bc *Blockchain) canAddBlockUnlocked(block *Block) bool {
 	}
 
 	return true
+}
+
+// TryAdoptFork は受信したチェーン断片を既存チェーンの候補として評価し、
+// 累積ワーク量が優位なら末尾を置き換える。
+func (bc *Blockchain) TryAdoptFork(incoming []Block) (bool, error) {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+
+	if len(incoming) == 0 {
+		return false, nil
+	}
+
+	start := incoming[0].Height
+	if start == 0 {
+		return false, errors.New("fork from genesis is not supported")
+	}
+
+	if len(bc.chain) == 0 {
+		return false, errors.New("current chain is empty")
+	}
+
+	currentHeight := uint64(len(bc.chain) - 1)
+	if start > currentHeight+1 {
+		return false, fmt.Errorf("fork has gap: start=%d current=%d", start, currentHeight)
+	}
+
+	reorgDepth := int(currentHeight + 1 - start)
+	if reorgDepth > bc.maxReorgDepth {
+		return false, fmt.Errorf("reorg depth %d exceeds limit %d", reorgDepth, bc.maxReorgDepth)
+	}
+
+	baseHash := bc.chain[start-1]
+	base := bc.getBlockByHashUnlocked(baseHash)
+	if base == nil {
+		return false, errors.New("fork base block not found")
+	}
+
+	prevHash := base.Hash
+	for i := range incoming {
+		block := &incoming[i]
+		expectedHeight := start + uint64(i)
+		if block.Height != expectedHeight {
+			return false, fmt.Errorf("incoming height mismatch: expected %d got %d", expectedHeight, block.Height)
+		}
+		if block.PreviousHash != prevHash {
+			return false, fmt.Errorf("incoming previous hash mismatch at %d", block.Height)
+		}
+		if calculated := bc.CalculateBlockHash(block); calculated != block.Hash {
+			return false, fmt.Errorf("incoming hash mismatch at %d", block.Height)
+		}
+		if !bc.CheckPoW(block.Hash, block.Difficulty) {
+			return false, fmt.Errorf("incoming proof of work invalid at %d", block.Height)
+		}
+		prevHash = block.Hash
+	}
+
+	oldWork := big.NewInt(0)
+	if start <= currentHeight {
+		for h := start; h <= currentHeight; h++ {
+			hash := bc.chain[h]
+			block := bc.getBlockByHashUnlocked(hash)
+			if block == nil {
+				return false, fmt.Errorf("missing local block at %d", h)
+			}
+			work := big.NewInt(2)
+			work.Exp(work, big.NewInt(int64(block.Difficulty)), nil)
+			oldWork.Add(oldWork, work)
+		}
+	}
+
+	newWork := big.NewInt(0)
+	for i := range incoming {
+		work := big.NewInt(2)
+		work.Exp(work, big.NewInt(int64(incoming[i].Difficulty)), nil)
+		newWork.Add(newWork, work)
+	}
+
+	oldLength := uint64(0)
+	if start <= currentHeight {
+		oldLength = currentHeight - start + 1
+	}
+	newLength := uint64(len(incoming))
+
+	if newWork.Cmp(oldWork) < 0 || (newWork.Cmp(oldWork) == 0 && newLength <= oldLength) {
+		return false, nil
+	}
+
+	bc.chain = bc.chain[:start]
+	for i := range incoming {
+		block := incoming[i]
+		bc.blocks[block.Hash] = &block
+		bc.chain = append(bc.chain, block.Hash)
+		if err := bc.saveBlockToDiskUnlocked(&block); err != nil {
+			return false, fmt.Errorf("failed to persist adopted block %d: %w", block.Height, err)
+		}
+	}
+
+	if len(bc.chain) > 0 {
+		latest := bc.getBlockByHashUnlocked(bc.chain[len(bc.chain)-1])
+		if latest != nil {
+			bc.difficulty = latest.Difficulty
+		}
+	}
+
+	bc.trimMemoryCacheUnlocked()
+	return true, nil
 }
 
 // ValidateTransaction はトランザクション署名を検証
@@ -770,19 +1006,52 @@ func (bc *Blockchain) LoadChain() error {
 		return nil
 	}
 
-	// chain/{height}/ の全ディレクトリを走査
+	// chain/ 配下のディレクトリを走査
 	entries, err := ioutil.ReadDir(chainDir)
 	if err != nil {
 		return fmt.Errorf("failed to read chain directory: %w", err)
 	}
 
-	var heights []uint64
+	blocksByHeight := make(map[uint64]*Block)
 	for _, entry := range entries {
-		if entry.IsDir() {
-			if height, err := strconv.ParseUint(entry.Name(), 10, 64); err == nil {
-				heights = append(heights, height)
+		if !entry.IsDir() {
+			continue
+		}
+
+		// 旧構成互換: chain/{height}/{hash}.json
+		if legacyHeight, parseErr := strconv.ParseUint(entry.Name(), 10, 64); parseErr == nil {
+			if block := readBlockFromHeightDir(filepath.Join(chainDir, entry.Name())); block != nil {
+				blocksByHeight[legacyHeight] = block
+			}
+			continue
+		}
+
+		// 新構成: chain/{bucket-range}/{height}/{hash}.json
+		bucketDir := filepath.Join(chainDir, entry.Name())
+		heightEntries, readErr := ioutil.ReadDir(bucketDir)
+		if readErr != nil {
+			continue
+		}
+
+		for _, heightEntry := range heightEntries {
+			if !heightEntry.IsDir() {
+				continue
+			}
+
+			height, parseErr := strconv.ParseUint(heightEntry.Name(), 10, 64)
+			if parseErr != nil {
+				continue
+			}
+
+			if block := readBlockFromHeightDir(filepath.Join(bucketDir, heightEntry.Name())); block != nil {
+				blocksByHeight[height] = block
 			}
 		}
+	}
+
+	var heights []uint64
+	for height := range blocksByHeight {
+		heights = append(heights, height)
 	}
 
 	// 高さでソート
@@ -804,31 +1073,7 @@ func (bc *Blockchain) LoadChain() error {
 	}
 
 	for _, height := range sortHeights {
-		heightDir := filepath.Join(chainDir, strconv.FormatUint(height, 10))
-		blockEntries, err := ioutil.ReadDir(heightDir)
-		if err != nil {
-			continue
-		}
-
-		// 各ブロックを読込
-		var blockData *Block
-		for _, blockEntry := range blockEntries {
-			if !blockEntry.IsDir() && filepath.Ext(blockEntry.Name()) == ".json" {
-				blockPath := filepath.Join(heightDir, blockEntry.Name())
-				fileData, err := ioutil.ReadFile(blockPath)
-				if err != nil {
-					continue
-				}
-
-				if err := json.Unmarshal(fileData, &blockData); err != nil {
-					continue
-				}
-
-				// この高さにブロックが見つかった
-				break
-			}
-		}
-
+		blockData := blocksByHeight[height]
 		if blockData == nil {
 			continue
 		}
@@ -861,6 +1106,37 @@ func (bc *Blockchain) LoadChain() error {
 		if latestHeight%20 == 0 {
 			bc.adjustDifficulty(latestHeight)
 		}
+	}
+
+	// 起動時ロード後は最小限のみメモリ保持し、取得時にディスクから復元する。
+	bc.trimMemoryCacheUnlocked()
+
+	return nil
+}
+
+func readBlockFromHeightDir(heightDir string) *Block {
+	blockEntries, err := ioutil.ReadDir(heightDir)
+	if err != nil {
+		return nil
+	}
+
+	for _, blockEntry := range blockEntries {
+		if blockEntry.IsDir() || filepath.Ext(blockEntry.Name()) != ".json" {
+			continue
+		}
+
+		blockPath := filepath.Join(heightDir, blockEntry.Name())
+		fileData, readErr := ioutil.ReadFile(blockPath)
+		if readErr != nil {
+			continue
+		}
+
+		var blockData *Block
+		if unmarshalErr := json.Unmarshal(fileData, &blockData); unmarshalErr != nil {
+			continue
+		}
+
+		return blockData
 	}
 
 	return nil

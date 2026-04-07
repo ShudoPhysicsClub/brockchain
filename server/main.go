@@ -307,6 +307,55 @@ type PeerManager struct {
 	maxOutboundPeers int
 }
 
+type peerConnection struct {
+	Addr string
+	Conn net.Conn
+}
+
+type chainSyncPayload struct {
+	Type       string        `json:"type"`
+	QueryID    string        `json:"query_id,omitempty"`
+	FromHeight uint64        `json:"from_height"`
+	TipHeight  uint64        `json:"tip_height,omitempty"`
+	Limit      uint64        `json:"limit,omitempty"`
+	Blocks     []chain.Block `json:"blocks,omitempty"`
+}
+
+const (
+	chainSyncRequestType  = "sync_request"
+	chainSyncResponseType = "sync_response"
+	chainTipRequestType   = "sync_tip_request"
+	chainTipResponseType  = "sync_tip_response"
+	defaultSyncBatchSize  = uint64(128)
+	maxSyncBatchSize      = uint64(256)
+	syncResponseTimeout   = 12 * time.Second
+	periodicSyncInterval  = 24 * time.Hour
+	maxSyncRetries        = 2
+)
+
+type syncTipResult struct {
+	Addr      string
+	TipHeight uint64
+}
+
+var syncTipQueryBus = struct {
+	mu      sync.Mutex
+	waiters map[string]chan syncTipResult
+}{
+	waiters: make(map[string]chan syncTipResult),
+}
+
+type syncSessionState struct {
+	mu          sync.Mutex
+	active      bool
+	peer        string
+	retries     int
+	lastRequest uint64
+	timer       *time.Timer
+}
+
+var syncSession syncSessionState
+
 // NewPeerManager は PeerManager を初期化
 func NewPeerManager(maxPeers int) *PeerManager {
 	return &PeerManager{
@@ -347,6 +396,22 @@ func (pm *PeerManager) GetPeerCount() int {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 	return len(pm.peers)
+}
+
+// SnapshotPeers は現在接続しているピアをスナップショットで返す。
+func (pm *PeerManager) SnapshotPeers() []peerConnection {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+
+	peers := make([]peerConnection, 0, len(pm.peers))
+	for addr, conn := range pm.peers {
+		if conn == nil {
+			continue
+		}
+		peers = append(peers, peerConnection{Addr: addr, Conn: conn})
+	}
+
+	return peers
 }
 
 // BroadcastMessage はすべてのピアにメッセージをブロードキャスト
@@ -429,6 +494,477 @@ func broadcastAcceptedTransaction(pm *PeerManager, tx *chain.Transaction) {
 	}
 
 	pm.BroadcastMessage(encoded)
+}
+
+func buildChainMessage(msgType network.MessageType, payload interface{}, requestID string) ([]byte, error) {
+	rawPayload, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	msg := network.Message{
+		Type:      msgType,
+		Timestamp: time.Now().Unix(),
+		Sender:    "",
+		To:        "",
+		App:       network.AppTypeChain,
+		Payload:   rawPayload,
+		RequestID: requestID,
+		TTL:       255,
+	}
+
+	return json.Marshal(msg)
+}
+
+func requestDiffSyncToConn(conn net.Conn, fromHeight, limit uint64) error {
+	if conn == nil {
+		return fmt.Errorf("peer connection is nil")
+	}
+
+	if limit == 0 {
+		limit = defaultSyncBatchSize
+	}
+	if limit > maxSyncBatchSize {
+		limit = maxSyncBatchSize
+	}
+
+	payload := chainSyncPayload{
+		Type:       chainSyncRequestType,
+		FromHeight: fromHeight,
+		Limit:      limit,
+	}
+
+	encoded, err := buildChainMessage(network.MessageTypeMessage, payload, fmt.Sprintf("sync-req-%d", time.Now().UnixNano()))
+	if err != nil {
+		return err
+	}
+
+	_, err = conn.Write(encoded)
+	return err
+}
+
+func registerSyncTipQuery(queryID string) chan syncTipResult {
+	syncTipQueryBus.mu.Lock()
+	defer syncTipQueryBus.mu.Unlock()
+
+	ch := make(chan syncTipResult, 32)
+	syncTipQueryBus.waiters[queryID] = ch
+	return ch
+}
+
+func unregisterSyncTipQuery(queryID string) {
+	syncTipQueryBus.mu.Lock()
+	defer syncTipQueryBus.mu.Unlock()
+
+	if ch, exists := syncTipQueryBus.waiters[queryID]; exists {
+		delete(syncTipQueryBus.waiters, queryID)
+		close(ch)
+	}
+}
+
+func publishSyncTipResult(queryID, addr string, tipHeight uint64) {
+	syncTipQueryBus.mu.Lock()
+	ch, exists := syncTipQueryBus.waiters[queryID]
+	syncTipQueryBus.mu.Unlock()
+	if !exists {
+		return
+	}
+
+	select {
+	case ch <- syncTipResult{Addr: addr, TipHeight: tipHeight}:
+	default:
+	}
+}
+
+func requestTipToConn(conn net.Conn, queryID string) error {
+	if conn == nil {
+		return fmt.Errorf("peer connection is nil")
+	}
+
+	payload := chainSyncPayload{Type: chainTipRequestType, QueryID: queryID}
+	encoded, err := buildChainMessage(network.MessageTypeMessage, payload, fmt.Sprintf("tip-req-%d", time.Now().UnixNano()))
+	if err != nil {
+		return err
+	}
+
+	_, err = conn.Write(encoded)
+	return err
+}
+
+func queryPeerTips(pm *PeerManager, timeout time.Duration) []syncTipResult {
+	if pm == nil {
+		return nil
+	}
+
+	peers := pm.SnapshotPeers()
+	if len(peers) == 0 {
+		return nil
+	}
+
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+
+	queryID := fmt.Sprintf("tip-query-%d", time.Now().UnixNano())
+	resultsCh := registerSyncTipQuery(queryID)
+	defer unregisterSyncTipQuery(queryID)
+
+	sent := 0
+	for _, peer := range peers {
+		if err := requestTipToConn(peer.Conn, queryID); err != nil {
+			fmt.Printf("⚠ ブロック高問い合わせ失敗 (%s): %v\n", peer.Addr, err)
+			continue
+		}
+		sent++
+	}
+
+	if sent == 0 {
+		return nil
+	}
+
+	results := make([]syncTipResult, 0, sent)
+	seen := make(map[string]struct{})
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	for len(results) < sent {
+		select {
+		case res, ok := <-resultsCh:
+			if !ok {
+				return results
+			}
+			if _, exists := seen[res.Addr]; exists {
+				continue
+			}
+			seen[res.Addr] = struct{}{}
+			results = append(results, res)
+		case <-timer.C:
+			return results
+		}
+	}
+
+	return results
+}
+
+func selectBestTipPeer(pm *PeerManager, localHeight uint64, tips []syncTipResult) (peerConnection, uint64, bool) {
+	if pm == nil || len(tips) == 0 {
+		return peerConnection{}, localHeight, false
+	}
+
+	peerMap := make(map[string]peerConnection)
+	for _, peer := range pm.SnapshotPeers() {
+		peerMap[peer.Addr] = peer
+	}
+
+	bestHeight := localHeight
+	bestPeer := peerConnection{}
+	found := false
+	for _, tip := range tips {
+		peer, exists := peerMap[tip.Addr]
+		if !exists {
+			continue
+		}
+		if tip.TipHeight > bestHeight {
+			bestHeight = tip.TipHeight
+			bestPeer = peer
+			found = true
+		}
+	}
+
+	return bestPeer, bestHeight, found
+}
+
+func stopSyncWatchdog() {
+	syncSession.mu.Lock()
+	defer syncSession.mu.Unlock()
+
+	if syncSession.timer != nil {
+		syncSession.timer.Stop()
+		syncSession.timer = nil
+	}
+	syncSession.active = false
+	syncSession.peer = ""
+	syncSession.retries = 0
+	syncSession.lastRequest = 0
+}
+
+func touchSyncWatchdog(node *Node, pm *PeerManager) {
+	if node == nil || pm == nil {
+		return
+	}
+
+	syncSession.mu.Lock()
+	defer syncSession.mu.Unlock()
+
+	if !syncSession.active {
+		return
+	}
+
+	if syncSession.timer != nil {
+		syncSession.timer.Stop()
+	}
+
+	syncSession.timer = time.AfterFunc(syncResponseTimeout, func() {
+		syncSession.mu.Lock()
+		if !syncSession.active {
+			syncSession.mu.Unlock()
+			return
+		}
+
+		retry := syncSession.retries
+		lastReq := syncSession.lastRequest
+		syncSession.retries++
+		syncSession.mu.Unlock()
+
+		if retry >= maxSyncRetries {
+			fmt.Printf("⚠ 同期タイムアウト: retry 上限に達したため停止\n")
+			node.StopSync()
+			stopSyncWatchdog()
+			return
+		}
+
+		fmt.Printf("⚠ 同期応答タイムアウト: retry=%d from=%d\n", retry+1, lastReq)
+		if err := startSyncFromBestPeer(node, pm, lastReq); err != nil {
+			fmt.Printf("⚠ 同期再要求失敗: %v\n", err)
+		}
+	})
+}
+
+func startSyncFromBestPeer(node *Node, pm *PeerManager, fromHeight uint64) error {
+	if node == nil {
+		return fmt.Errorf("node is nil")
+	}
+	if pm == nil {
+		return fmt.Errorf("peer manager is nil")
+	}
+
+	localHeight := node.GetChainHeight()
+	if fromHeight == 0 {
+		fromHeight = localHeight + 1
+	}
+
+	tips := queryPeerTips(pm, 2*time.Second)
+	bestPeer, bestHeight, found := selectBestTipPeer(pm, localHeight, tips)
+	if !found {
+		return fmt.Errorf("no higher peer tip found")
+	}
+
+	if err := node.StartSync(fromHeight); err != nil {
+		return err
+	}
+
+	if err := requestDiffSyncToConn(bestPeer.Conn, fromHeight, defaultSyncBatchSize); err != nil {
+		node.StopSync()
+		return err
+	}
+
+	syncSession.mu.Lock()
+	syncSession.active = true
+	syncSession.peer = bestPeer.Addr
+	syncSession.retries = 0
+	syncSession.lastRequest = fromHeight
+	syncSession.mu.Unlock()
+	touchSyncWatchdog(node, pm)
+
+	fmt.Printf("🔄 同期開始: peer=%s from=%d local=%d remote=%d\n", bestPeer.Addr, fromHeight, localHeight, bestHeight)
+	return nil
+}
+
+func requestDiffSyncFromMesh(node *Node, pm *PeerManager, fromHeight, limit uint64) int {
+	if node == nil || pm == nil {
+		return 0
+	}
+
+	peers := pm.SnapshotPeers()
+	sent := 0
+	for _, peer := range peers {
+		if err := requestDiffSyncToConn(peer.Conn, fromHeight, limit); err != nil {
+			fmt.Printf("⚠ 差分同期要求送信失敗 (%s): %v\n", peer.Addr, err)
+			continue
+		}
+		sent++
+	}
+
+	return sent
+}
+
+func respondDiffSync(conn net.Conn, node *Node, req chainSyncPayload) {
+	if conn == nil || node == nil {
+		return
+	}
+
+	limit := req.Limit
+	if limit == 0 {
+		limit = defaultSyncBatchSize
+	}
+	if limit > maxSyncBatchSize {
+		limit = maxSyncBatchSize
+	}
+
+	tip := node.GetChainHeight()
+	blocks := make([]chain.Block, 0, limit)
+	for h := req.FromHeight; h <= tip && uint64(len(blocks)) < limit; h++ {
+		block := node.GetBlock(h)
+		if block == nil {
+			continue
+		}
+		blocks = append(blocks, *block)
+	}
+
+	resp := chainSyncPayload{
+		Type:       chainSyncResponseType,
+		FromHeight: req.FromHeight,
+		TipHeight:  tip,
+		Limit:      limit,
+		Blocks:     blocks,
+	}
+
+	encoded, err := buildChainMessage(network.MessageTypeMessage, resp, fmt.Sprintf("sync-resp-%d", time.Now().UnixNano()))
+	if err != nil {
+		fmt.Printf("⚠ 同期応答の作成失敗: %v\n", err)
+		return
+	}
+
+	if _, err := conn.Write(encoded); err != nil {
+		fmt.Printf("⚠ 同期応答送信失敗: %v\n", err)
+	}
+}
+
+func handleDiffSyncResponse(conn net.Conn, node *Node, pm *PeerManager, resp chainSyncPayload) {
+	if conn == nil || node == nil || pm == nil {
+		return
+	}
+
+	localHeight := node.GetChainHeight()
+	if len(resp.Blocks) > 0 && resp.FromHeight <= localHeight {
+		adopted, err := node.TryAdoptFork(resp.Blocks)
+		if err != nil {
+			fmt.Printf("⚠ フォーク候補評価失敗: %v\n", err)
+		} else if adopted {
+			fmt.Printf("♻ フォーク採用: from=%d count=%d\n", resp.FromHeight, len(resp.Blocks))
+		}
+
+		nextHeight := node.GetChainHeight() + 1
+		syncSession.mu.Lock()
+		syncSession.lastRequest = nextHeight
+		syncSession.mu.Unlock()
+		touchSyncWatchdog(node, pm)
+		if nextHeight <= resp.TipHeight {
+			_ = requestDiffSyncToConn(conn, nextHeight, resp.Limit)
+			return
+		}
+
+		if err := node.ValidateFullChain(); err != nil {
+			fmt.Printf("❌ 同期後チェーン検証失敗: %v\n", err)
+		} else {
+			fmt.Printf("✓ 同期後チェーン検証OK\n")
+		}
+		node.StopSync()
+		stopSyncWatchdog()
+		return
+	}
+
+	added := 0
+	for i := range resp.Blocks {
+		block := resp.Blocks[i]
+		if block.Height == 0 {
+			continue
+		}
+		if err := node.AddSyncBlock(&block); err == nil {
+			added++
+		}
+	}
+
+	if added > 0 {
+		if err := node.FinalizeSyncBlocks(); err != nil {
+			fmt.Printf("⚠ 同期ブロック確定失敗: %v\n", err)
+		}
+	}
+
+	if len(resp.Blocks) == 0 {
+		if err := node.ValidateFullChain(); err != nil {
+			fmt.Printf("❌ 同期後チェーン検証失敗: %v\n", err)
+		} else {
+			fmt.Printf("✓ 同期後チェーン検証OK\n")
+		}
+		node.StopSync()
+		stopSyncWatchdog()
+		return
+	}
+
+	nextHeight := resp.FromHeight + uint64(len(resp.Blocks))
+	syncSession.mu.Lock()
+	syncSession.lastRequest = nextHeight
+	syncSession.mu.Unlock()
+	touchSyncWatchdog(node, pm)
+	if nextHeight > resp.TipHeight {
+		if err := node.ValidateFullChain(); err != nil {
+			fmt.Printf("❌ 同期後チェーン検証失敗: %v\n", err)
+		} else {
+			fmt.Printf("✓ 同期後チェーン検証OK\n")
+		}
+		node.StopSync()
+		stopSyncWatchdog()
+		return
+	}
+
+	_ = requestDiffSyncToConn(conn, nextHeight, resp.Limit)
+}
+
+func handlePeerStream(conn net.Conn, peerAddr string, pm *PeerManager, node *Node) {
+	if conn == nil {
+		return
+	}
+
+	decoder := json.NewDecoder(conn)
+	for {
+		var msg network.Message
+		if err := decoder.Decode(&msg); err != nil {
+			return
+		}
+
+		switch msg.Type {
+		case network.MessageTypeBlock:
+			var block chain.Block
+			if err := json.Unmarshal(msg.Payload, &block); err != nil {
+				continue
+			}
+			if err := node.ValidateAndAddBlock(&block); err != nil {
+				continue
+			}
+		case network.MessageTypeMessage:
+			if msg.App != network.AppTypeChain {
+				continue
+			}
+
+			var payload chainSyncPayload
+			if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+				continue
+			}
+
+			switch payload.Type {
+			case chainSyncRequestType:
+				respondDiffSync(conn, node, payload)
+			case chainSyncResponseType:
+				handleDiffSyncResponse(conn, node, pm, payload)
+			case chainTipRequestType:
+				resp := chainSyncPayload{
+					Type:      chainTipResponseType,
+					QueryID:   payload.QueryID,
+					TipHeight: node.GetChainHeight(),
+				}
+				encoded, err := buildChainMessage(network.MessageTypeMessage, resp, fmt.Sprintf("tip-resp-%d", time.Now().UnixNano()))
+				if err != nil {
+					continue
+				}
+				_, _ = conn.Write(encoded)
+			case chainTipResponseType:
+				if payload.QueryID != "" {
+					publishSyncTipResult(payload.QueryID, peerAddr, payload.TipHeight)
+				}
+			}
+		}
+	}
 }
 
 // ============================================================
@@ -1437,6 +1973,13 @@ func (h *JSONRPCHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	resp.Jsonrpc = "2.0"
 	resp.ID = req.ID
 
+	if h.node.IsSyncing() && req.Method != "brockchain_status" {
+		resp.Error = "node is syncing; method temporarily unavailable"
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
 	switch req.Method {
 	case "eth_blockNumber":
 		// チェーン高を16進数で返す
@@ -1983,11 +2526,11 @@ func main() {
 			peerAddr := conn.RemoteAddr().String()
 			pm.AddPeer(peerAddr, conn)
 
-			// ピア通信処理（TBD）
+			// ピア通信処理（ブロック伝播/差分同期）
 			go func(c net.Conn) {
 				defer c.Close()
 				defer pm.RemovePeer(c.RemoteAddr().String())
-				// ピア通信処理
+				handlePeerStream(c, c.RemoteAddr().String(), pm, node)
 			}(conn)
 		}
 	}()
@@ -2016,18 +2559,42 @@ func main() {
 				if pm.AddPeer(peerAddr, conn) {
 					connectCount++
 
-					// ピア通信処理（TBD）
+					// ピア通信処理（ブロック伝播/差分同期）
 					go func(c net.Conn) {
 						defer c.Close()
 						defer pm.RemovePeer(c.RemoteAddr().String())
-						// ピア通信処理
+						handlePeerStream(c, c.RemoteAddr().String(), pm, node)
 					}(conn)
 				}
 			}
 
 			fmt.Printf("✓ アウトバウンド接続: %d / %d\n", connectCount, maxOutboundPeers)
+
+			if connectCount > 0 {
+				if err := startSyncFromBestPeer(node, pm, 0); err != nil {
+					fmt.Printf("⚠ 同期開始スキップ: %v\n", err)
+				}
+			}
 		}()
 	}
+
+	// 24時間ごとに接続ピアのtip高を問い合わせて差分同期する。
+	go func() {
+		ticker := time.NewTicker(periodicSyncInterval)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			if node.IsSyncing() {
+				continue
+			}
+			if pm.GetPeerCount() == 0 {
+				continue
+			}
+			if err := startSyncFromBestPeer(node, pm, 0); err != nil {
+				fmt.Printf("⚠ 定期差分同期スキップ: %v\n", err)
+			}
+		}
+	}()
 
 	// REPL (CLI)
 	fmt.Println("\n📝 コマンド入力可能: shutdown, status, peers, help")
@@ -2047,6 +2614,11 @@ func main() {
 
 		parts := strings.Fields(cmd)
 		command := parts[0]
+
+		if node.IsSyncing() && command != "shutdown" && command != "status" && command != "help" {
+			fmt.Println("⏳ 同期中のため、このコマンドは一時的に無効です")
+			continue
+		}
 
 		switch command {
 		case "shutdown":
@@ -2069,6 +2641,7 @@ func main() {
 			fmt.Println("  shutdown      - ノードをシャットダウン")
 			fmt.Println("  status        - ノード状態を表示")
 			fmt.Println("  peers         - ピア接続情報を表示")
+			fmt.Println("  sync          - メッシュ差分同期を実行")
 			fmt.Println("  mempool       - Mempool トランザクション数")
 			fmt.Println("  height        - ブロックチェーン高")
 			fmt.Println("  token         - token 検索")
@@ -2079,6 +2652,11 @@ func main() {
 		case "peers":
 			peerCount := pm.GetPeerCount()
 			fmt.Printf("🌐 接続ピア数: %d / %d\n", peerCount, maxOutboundPeers)
+
+		case "sync":
+			if err := startSyncFromBestPeer(node, pm, 0); err != nil {
+				fmt.Printf("⚠ 同期開始不可: %v\n", err)
+			}
 
 		case "mempool":
 			fmt.Printf("Mempool 内のトランザクション数: %d\n", node.GetMempoolSize())

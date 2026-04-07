@@ -132,11 +132,6 @@ func (n *Node) ValidateAndAddBlock(block *chain.Block) error {
 		return fmt.Errorf("failed to add block to chain: %w", err)
 	}
 
-	// ディスク保存
-	if err := n.bc.SaveBlockToDisk(block); err != nil {
-		return fmt.Errorf("failed to save block to disk: %w", err)
-	}
-
 	// ブロック内の TX をメモリプールから削除
 	n.mp.RemoveTransactionsByBlock(block)
 
@@ -328,6 +323,20 @@ func (n *Node) IsValidBlock(block *chain.Block) bool {
 		return false
 	}
 	return true
+}
+
+// ValidateFullChain はディスクベースでチェーン全体を逐次検証する。
+func (n *Node) ValidateFullChain() error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.bc.ValidateChainStream()
+}
+
+// TryAdoptFork は受信したチェーン断片の採用可否を判定し、必要なら末尾置換する。
+func (n *Node) TryAdoptFork(blocks []chain.Block) (bool, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.bc.TryAdoptFork(blocks)
 }
 
 // ============================================================
